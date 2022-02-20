@@ -172,7 +172,7 @@ var (
 	DeveloperGasLimitFlag = cli.Uint64Flag{
 		Name:  "dev.gaslimit",
 		Usage: "Initial block gas limit",
-		Value: 11500000,
+		Value: 1150000000, // changed from 11500000
 	}
 	IdentityFlag = cli.StringFlag{
 		Name:  "identity",
