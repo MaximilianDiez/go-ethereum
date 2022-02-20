@@ -23,7 +23,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/math"
+//	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/blake2b"
 	"github.com/ethereum/go-ethereum/crypto/bls12381"
@@ -32,6 +32,10 @@ import (
 
 	//lint:ignore SA1019 Needed for precompile
 	"golang.org/x/crypto/ripemd160"
+
+	"github.com/ethereum/go-ethereum/log"
+	
+	"github.com/herumi/bls-eth-go-binary/bls"
 )
 
 // PrecompiledContract is the basic interface for native Go contracts. The implementation
@@ -292,102 +296,90 @@ func modexpMultComplexity(x *big.Int) *big.Int {
 }
 
 // RequiredGas returns the gas required to execute the pre-compiled contract.
+// Replacing the ModExp precompile Gas cost calculation with an estimation of the Gas cost 
+// caused by EIP-2537 operations on the BLS12-381 curve.
 func (c *bigModExp) RequiredGas(input []byte) uint64 {
-	var (
-		baseLen = new(big.Int).SetBytes(getData(input, 0, 32))
-		expLen  = new(big.Int).SetBytes(getData(input, 32, 32))
-		modLen  = new(big.Int).SetBytes(getData(input, 64, 32))
-	)
-	if len(input) > 96 {
-		input = input[96:]
-	} else {
-		input = input[:0]
-	}
-	// Retrieve the head 32 bytes of exp for the adjusted exponent length
-	var expHead *big.Int
-	if big.NewInt(int64(len(input))).Cmp(baseLen) <= 0 {
-		expHead = new(big.Int)
-	} else {
-		if expLen.Cmp(big32) > 0 {
-			expHead = new(big.Int).SetBytes(getData(input, baseLen.Uint64(), 32))
-		} else {
-			expHead = new(big.Int).SetBytes(getData(input, baseLen.Uint64(), expLen.Uint64()))
-		}
-	}
-	// Calculate the adjusted exponent length
-	var msb int
-	if bitlen := expHead.BitLen(); bitlen > 0 {
-		msb = bitlen - 1
-	}
-	adjExpLen := new(big.Int)
-	if expLen.Cmp(big32) > 0 {
-		adjExpLen.Sub(expLen, big32)
-		adjExpLen.Mul(big8, adjExpLen)
-	}
-	adjExpLen.Add(adjExpLen, big.NewInt(int64(msb)))
-	// Calculate the gas cost of the operation
-	gas := new(big.Int).Set(math.BigMax(modLen, baseLen))
-	if c.eip2565 {
-		// EIP-2565 has three changes
-		// 1. Different multComplexity (inlined here)
-		// in EIP-2565 (https://eips.ethereum.org/EIPS/eip-2565):
-		//
-		// def mult_complexity(x):
-		//    ceiling(x/8)^2
-		//
-		//where is x is max(length_of_MODULUS, length_of_BASE)
-		gas = gas.Add(gas, big7)
-		gas = gas.Div(gas, big8)
-		gas.Mul(gas, gas)
-
-		gas.Mul(gas, math.BigMax(adjExpLen, big1))
-		// 2. Different divisor (`GQUADDIVISOR`) (3)
-		gas.Div(gas, big3)
-		if gas.BitLen() > 64 {
-			return math.MaxUint64
-		}
-		// 3. Minimum price of 200 gas
-		if gas.Uint64() < 200 {
-			return 200
-		}
-		return gas.Uint64()
-	}
-	gas = modexpMultComplexity(gas)
-	gas.Mul(gas, math.BigMax(adjExpLen, big1))
-	gas.Div(gas, big20)
-
-	if gas.BitLen() > 64 {
-		return math.MaxUint64
-	}
-	return gas.Uint64()
+	// log.Info("Calculating required gas with", "input", input, "length", len(input))
+	log.Warn("Calculating required gas with", "length", len(input))
+	numberOfPKs := int(binary.BigEndian.Uint16(input[128:130]))
+	var cost int
+	// [not EIP-2537] hash message to 2 field elements in FQ2
+	cost += 110000 * 2 // 1 * map message field element to 2 G2 points (why 2x?)
+	cost += 4500       // G2 addition of 2 message G2 points (why necessary?)
+	// [not EIP-2537] clear message cofactor
+	// [not EIP-2537] map octet string of signature to int, then decompress G2 point (recover y value)
+	// [not EIP-2537] 600 * map octet string of public key to int, then decompress G1 point (recover y value)
+	cost += 500 * numberOfPKs // aggregate public keys with addition in G1
+	// [depending on interface] [not EIP-2537] G1 decompressed to G1 compressed to octet string
+	cost += 23000*2 + 115000 // pairing with 2 pairs to check for signature validity
+	log.Warn("Gas calculated", "cost", cost)
+	return uint64(cost)
 }
 
+// Replacing the ModExp precompile with a FastAggregateVerify precompile based on Herumi BLS. 
+// It verifies a given signature, message and public key array triple. True is returned if valid, false if invalid.
 func (c *bigModExp) Run(input []byte) ([]byte, error) {
-	var (
-		baseLen = new(big.Int).SetBytes(getData(input, 0, 32)).Uint64()
-		expLen  = new(big.Int).SetBytes(getData(input, 32, 32)).Uint64()
-		modLen  = new(big.Int).SetBytes(getData(input, 64, 32)).Uint64()
-	)
-	if len(input) > 96 {
-		input = input[96:]
+	log.Warn("Using BLS12_381 BLS signature precompile")
+	// log.Info("Received input", "input", input, "length", len(input))
+	log.Warn("Received input", "length", len(input))
+	error := bls.Init(bls.BLS12_381)
+	if error != nil {
+		log.Error(error.Error())
+		return make([]byte, 32), nil
+	}
+	error = bls.SetETHmode(bls.EthModeLatest)
+	if error != nil {
+		log.Error(error.Error())
+		return make([]byte, 32), nil
+	}
+
+	// var message [32]byte
+	message := input[0:32]
+	log.Warn("Message identified", "message", message)
+
+	// var signatureSerialized [96]byte
+	signatureSerialized := input[32:128]
+	log.Warn("Serialized signature identified", "signatureSerialized", signatureSerialized)
+	var signature bls.Sign
+	error = signature.Deserialize(signatureSerialized)
+	if error != nil {
+		log.Error(error.Error())
+		return make([]byte, 32), nil
+	}
+
+	// var length int
+	length := int(binary.BigEndian.Uint16(input[128:130])) // 2 byte for max 512
+	log.Warn("Length of public key array decoded", "length", length)
+	var publicKeys []bls.PublicKey
+
+	for i := 0; i < length; i++ {
+		var publicKey bls.PublicKey
+		// log.Info("Public key identified", "index", i, "publicKey", input[130+48*i:130+48*(i+1)])
+		error = publicKey.Deserialize(input[130+48*i : 130+48*(i+1)])
+		if error != nil {
+			log.Error(error.Error())
+			return make([]byte, 32), nil
+		}
+		publicKeys = append(publicKeys, publicKey)
+	}
+	// log.Info("Public key array assembled", "publicKeys", publicKeys)
+
+	result := signature.FastAggregateVerify(publicKeys, message)
+
+	var out []byte
+
+	if result == true {
+		log.Warn("BLS12_381 BLS signature precompile returned true for validation")
+		out = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+
 	} else {
-		input = input[:0]
+		log.Warn("BLS12_381 BLS signature precompile returned false for validation")
+		out = make([]byte, 32)
 	}
-	// Handle a special case when both the base and mod length is zero
-	if baseLen == 0 && modLen == 0 {
-		return []byte{}, nil
-	}
-	// Retrieve the operands and execute the exponentiation
-	var (
-		base = new(big.Int).SetBytes(getData(input, 0, baseLen))
-		exp  = new(big.Int).SetBytes(getData(input, baseLen, expLen))
-		mod  = new(big.Int).SetBytes(getData(input, baseLen+expLen, modLen))
-	)
-	if mod.BitLen() == 0 {
-		// Modulo 0 is undefined, return zero
-		return common.LeftPadBytes([]byte{}, int(modLen)), nil
-	}
-	return common.LeftPadBytes(base.Exp(base, exp, mod).Bytes(), int(modLen)), nil
+
+	log.Warn("Returning", "output", out, "error", nil)
+
+	return out, nil
 }
 
 // newCurvePoint unmarshals a binary blob into a bn256 elliptic curve point,
